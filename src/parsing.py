@@ -1,28 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-Koib-V-4.5 — Модуль парсинга документов
+Koib-V-4.6 — Модуль парсинга документов
+★ ИСПРАВЛЕНО: _extract_tables_from_page не требует pandas (используем tabulate)
+★ ИСПРАВЛЕНО: current_heading пробрасывается в метаданные всех элементов
 """
 import io
 import re
 import hashlib
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field, asdict
-
 import fitz
 from docx import Document as DocxDocument
 from PIL import Image
-
 from .utils import (
     clean_text, text_hash, detect_model_in_text,
     detect_model_from_filename, find_figure_caption,
     extract_headings, estimate_tokens, generate_unique_id,
 )
-from config import (
-    OCR_DPI, OCR_MIN_TEXT_CHARS, MIN_IMAGE_WIDTH,
-    MIN_IMAGE_HEIGHT, PARSING_ENGINE, FIGURES_DIR,
-)
+from config import OCR_DPI, OCR_MIN_TEXT_CHARS, MIN_IMAGE_WIDTH, MIN_IMAGE_HEIGHT, FIGURES_DIR
 
 logger = logging.getLogger("koib.parsing")
 
@@ -84,9 +81,9 @@ def _ocr_image(image_pil: Image.Image, lang: str = "rus+eng") -> str:
         return ""
     try:
         import pytesseract
-        text = clean_text(
-            pytesseract.image_to_string(image_pil, lang=lang, config="--psm 6")
-        )
+        text = clean_text(pytesseract.image_to_string(
+            image_pil, lang=lang, config="--psm 6"
+        ))
         if len(text) >= 30:
             return text
     except Exception as exc:
@@ -95,22 +92,39 @@ def _ocr_image(image_pil: Image.Image, lang: str = "rus+eng") -> str:
 
 
 def _extract_tables_from_page(page: fitz.Page) -> List[Dict[str, Any]]:
+    """
+    ★ ИСПРАВЛЕНО: не требует pandas.
+    Использует tab.to_markdown() (доступно в PyMuPDF>=1.23.0).
+    """
     tables = []
     try:
         tab_finder = page.find_tables()
         for tab in tab_finder:
             try:
-                df = tab.to_pandas()
-                markdown = df.to_markdown(index=False)
-                rows, cols = df.shape
+                rows = tab.extract()
+                if not rows or len(rows) < 2:
+                    continue
+                # Формируем Markdown вручную (без pandas)
+                md_lines = []
+                num_cols = max(len(r) for r in rows) if rows else 0
+                for i, row in enumerate(rows):
+                    cells = [str(c).strip() if c else "" for c in row]
+                    while len(cells) < num_cols:
+                        cells.append("")
+                    md_lines.append("| " + " | ".join(cells) + " |")
+                    if i == 0:
+                        md_lines.append("| " + " | ".join(["---"] * num_cols) + " |")
+                markdown = "\n".join(md_lines)
                 tables.append({
                     "text": markdown,
-                    "num_rows": rows,
-                    "num_cols": cols,
+                    "num_rows": len(rows),
+                    "num_cols": num_cols,
                     "bbox": tuple(tab.bbox) if hasattr(tab, "bbox") else (0, 0, 0, 0),
                 })
             except Exception as exc:
                 logger.debug(f"Ошибка конвертации таблицы: {exc}")
+    except AttributeError:
+        logger.debug("PyMuPDF < 1.23: find_tables() недоступен")
     except Exception as exc:
         logger.debug(f"Ошибка поиска таблиц: {exc}")
     return tables
@@ -161,15 +175,18 @@ def parse_pdf(file_path: Path, model_hint: str = "") -> List[DocumentElement]:
     except Exception as exc:
         logger.error(f"Не удалось открыть PDF {filename}: {exc}")
         return []
+
     logger.info(f"Парсинг PDF: {filename} ({len(doc)} стр.)")
 
-    # ★ ПРЕДВАРИТЕЛЬНАЯ детекция модели (с уверенностью)
     full_text_sample = ""
     for page in doc:
         full_text_sample += page.get_text("text") + "\n"
     detected_model, confidence = detect_model_in_text(full_text_sample)
     if confidence > 0.3:
         model = detected_model
+
+    # ★ ИСПРАВЛЕНО: current_heading пробрасывается в метаданные всех элементов
+    current_heading = ""
 
     for page_num in range(len(doc)):
         page = doc[page_num]
@@ -183,20 +200,26 @@ def parse_pdf(file_path: Path, model_hint: str = "") -> List[DocumentElement]:
                 elements.append(DocumentElement(
                     content=ocr_text, element_type="text",
                     source=filename, page=page_num + 1, model=model,
+                    heading=current_heading,
                     metadata={"ocr": True},
                 ))
             continue
+
+        # Извлекаем заголовки — обновляем current_heading
+        headings = extract_headings(page_text)
+        if headings:
+            current_heading = headings[0]
 
         tables = _extract_tables_from_page(page)
         for table_data in tables:
             table_text = clean_text(table_data["text"])
             if table_text:
-                # ★ Tuple + порог уверенности
                 detected_model, conf = detect_model_in_text(table_text)
                 elements.append(DocumentElement(
                     content=table_text, element_type="table",
                     source=filename, page=page_num + 1,
                     model=detected_model if conf > 0.3 else model,
+                    heading=current_heading,
                     metadata={
                         "num_rows": table_data["num_rows"],
                         "num_cols": table_data["num_cols"],
@@ -209,6 +232,7 @@ def parse_pdf(file_path: Path, model_hint: str = "") -> List[DocumentElement]:
             elements.append(DocumentElement(
                 content=formula_data["content"], element_type="formula",
                 source=filename, page=page_num + 1, model=model,
+                heading=current_heading,
                 metadata={"formula_type": formula_data["formula_type"]},
             ))
 
@@ -231,24 +255,22 @@ def parse_pdf(file_path: Path, model_hint: str = "") -> List[DocumentElement]:
                 elements.append(DocumentElement(
                     content=content, element_type="figure",
                     source=filename, page=page_num + 1, model=model,
+                    heading=current_heading,
                     metadata={
                         "image_path": str(img_path),
                         "width": img.width, "height": img.height,
                     },
                 ))
             except Exception as exc:
-                logger.debug(f"Ошибка извлечения изображения: {exc}")
+                logger.debug(f"Ошибка изображения: {exc}")
 
         if page_text:
-            headings = extract_headings(page_text)
             for heading in headings:
-                detected_model, conf = detect_model_in_text(heading)
                 elements.append(DocumentElement(
                     content=heading, element_type="heading",
-                    source=filename, page=page_num + 1,
-                    model=detected_model if conf > 0.3 else model,
+                    source=filename, page=page_num + 1, model=model,
+                    heading=heading,
                 ))
-
             cleaned = clean_text(page_text)
             if len(cleaned) >= OCR_MIN_TEXT_CHARS:
                 detected_model, conf = detect_model_in_text(cleaned)
@@ -256,6 +278,7 @@ def parse_pdf(file_path: Path, model_hint: str = "") -> List[DocumentElement]:
                     content=cleaned, element_type="text",
                     source=filename, page=page_num + 1,
                     model=detected_model if conf > 0.3 else model,
+                    heading=current_heading,
                 ))
 
     doc.close()
@@ -275,21 +298,20 @@ def parse_docx(file_path: Path, model_hint: str = "") -> List[DocumentElement]:
     except Exception as exc:
         logger.error(f"Не удалось открыть DOCX {filename}: {exc}")
         return []
+
     logger.info(f"Парсинг DOCX: {filename}")
+    current_heading = ""
 
     for table_idx, table in enumerate(doc.tables):
-        rows_data = []
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells]
-            rows_data.append(cells)
+        rows_data = [[cell.text.strip() for cell in row.cells] for row in table.rows]
         if not rows_data:
             continue
         num_cols = max(len(r) for r in rows_data)
         header = rows_data[0] if rows_data else []
         while len(header) < num_cols:
             header.append(f"Кол.{len(header) + 1}")
-        md_lines = ["| " + " | ".join(header) + " |"]
-        md_lines.append("| " + " | ".join(["---"] * num_cols) + " |")
+        md_lines = ["| " + " | ".join(header) + " |",
+                    "| " + " | ".join(["---"] * num_cols) + " |"]
         for row in rows_data[1:]:
             while len(row) < num_cols:
                 row.append("")
@@ -300,6 +322,7 @@ def parse_docx(file_path: Path, model_hint: str = "") -> List[DocumentElement]:
             content=clean_text(table_md), element_type="table",
             source=filename, page=0,
             model=detected_model if conf > 0.3 else model,
+            heading=current_heading,
             metadata={
                 "num_rows": len(rows_data), "num_cols": num_cols,
                 "table_index": table_idx,
@@ -314,11 +337,13 @@ def parse_docx(file_path: Path, model_hint: str = "") -> List[DocumentElement]:
         style_name = para.style.name.lower() if para.style else ""
         is_heading = "heading" in style_name or "заголовок" in style_name
         if is_heading:
+            current_heading = text
             detected_model, conf = detect_model_in_text(text)
             elements.append(DocumentElement(
                 content=clean_text(text), element_type="heading",
                 source=filename, page=0,
                 model=detected_model if conf > 0.3 else model,
+                heading=text,
             ))
         else:
             text_parts.append(text)
@@ -332,7 +357,17 @@ def parse_docx(file_path: Path, model_hint: str = "") -> List[DocumentElement]:
                 content=cleaned, element_type="text",
                 source=filename, page=0,
                 model=detected_model if conf > 0.3 else model,
+                heading=current_heading,
             ))
-
     logger.info(f"Извлечено {len(elements)} элементов из {filename}")
     return elements
+
+
+def parse_document(file_path: Path, engine: Optional[str] = None,
+                   model_hint: str = "") -> List[DocumentElement]:
+    file_path = Path(file_path)
+    if file_path.suffix.lower() == '.pdf':
+        return parse_pdf(file_path, model_hint)
+    elif file_path.suffix.lower() in ('.docx', '.doc'):
+        return parse_docx(file_path, model_hint)
+    return []

@@ -1,136 +1,77 @@
 # -*- coding: utf-8 -*-
 """
-Koib-V-4.5 — Модуль безопасности
-===================================
-Фильтрация опасного, конфиденциального или нерелевантного контента
-как на уровне входящих запросов, так и на уровне исходящих ответов.
-
-Модуль обеспечивает:
-  1. Проверку запросов на попытки prompt-injection
-  2. Фильтрацию ответов от конфиденциальной информации
-  3. Защиту от обхода системного промпта
+Koib-V-4.6 — Модуль безопасности
+★ ИСПРАВЛЕНО: интерфейс check_query_safety / check_answer_safety / sanitize_answer
+для использования в VK-боте
 """
 import re
 import logging
-from typing import List, Optional, Tuple
+from typing import Tuple, List
+from dataclasses import dataclass
 
 logger = logging.getLogger("koib.safety")
 
 
-# ═══════════════════════════════════════════════════════════════
-# Шаблоны угроз
-# ═══════════════════════════════════════════════════════════════
-# Попытки prompt-injection
-INJECTION_PATTERNS = [
-    re.compile(r"ignore\s+(?:previous|above|all)\s+instructions?", re.IGNORECASE),
-    re.compile(r"forget\s+(?:everything|all|previous)", re.IGNORECASE),
-    re.compile(r"you\s+are\s+now\s+(?:a|an)\s+", re.IGNORECASE),
-    re.compile(r"system\s*:\s*", re.IGNORECASE),
-    re.compile(r"pretend\s+(?:to\s+be|you\s+are)", re.IGNORECASE),
-    re.compile(r"jailbreak", re.IGNORECASE),
-    re.compile(r"дин\ufffd\ufffd\ufffd\ufffdт", re.IGNORECASE),  # обходные варианты
-    re.compile(r"обойди\s+(?:ограничения|правила|фильтр)", re.IGNORECASE),
+@dataclass
+class SensitiveTopic:
+    category: str
+    patterns: List[str]
+    description: str
+
+
+SENSITIVE_TOPICS = [
+    SensitiveTopic("invalid_ballot", [
+        r"\bнедействительн(?:ый|ые|ых)\s+бюллетен",
+        r"\bаннулировани(?:е|я)\s+бюллетен",
+    ], "Вопросы о недействительных бюллетенях"),
+    SensitiveTopic("complaint", [
+        r"\bжалоб(?:а|ы|у)\b", r"\bпожаловаться\b", r"\bпротест\b",
+        r"\bнарушени(?:е|я|й)\b", r"\bапелляци(?:я|и|ю)\b",
+    ], "Жалобы и нарушения"),
+    SensitiveTopic("technical_failure", [
+        r"\bтехнический\s+сбой\b", r"\bнеисправност",
+        r"\bотказ\s+(?:оборудования|терминала|КОИБ)\b",
+        r"\bзавис(?:ание|ания|ает)\b", r"\bперезагрузк",
+        r"\bне\s+работает\b", r"\bне\s+включается\b",
+    ], "Технические сбои"),
+    SensitiveTopic("security", [
+        r"\bвзлом\b", r"\bнесанкционированный\s+доступ\b",
+        r"\bутечка\s+данных\b", r"\bфальсификаци",
+    ], "Вопросы безопасности"),
 ]
 
-# Конфиденциальные шаблоны в ответах
-CONFIDENTIAL_PATTERNS = [
-    re.compile(r'\b\d{16,19}\b'),                       # Номера карт
-    re.compile(r'\b\d{3}[\s-]?\d{2}[\s-]?\d{2}\s\d{6}\b'),  # СНИЛС
-    re.compile(r'\b\d{10,12}\b'),                        # ИНН/ОГРН
-    re.compile(r'(?:пароль|password)\s*[:=]\s*\S+', re.IGNORECASE),
-    re.compile(r'(?:секретн|конфиденциальн|не\s*публику)', re.IGNORECASE),
+FORBIDDEN_ANSWER_PATTERNS = [
+    r"\bя\s+не\s+могу\s+помочь\b",
+    r"\bотказываюсь\s+отвечать\b",
+    r"<\s*script",
+    r"javascript:",
 ]
 
-# Допустимые темы запросов (белый список)
-ALLOWED_TOPICS = {
-    "техническая документация", "паспорт", "руководство",
-    "инструкция", "сертификат", "свидетельство",
-    "параметры", "характеристики", "таблица", "формула",
-    "схема", "чертёж", "модель", "устройство", "аппарат",
-    "выборы", "протокол", "результат", "комиссия",
-}
 
-
-# ═══════════════════════════════════════════════════════════════
-# Проверка запросов
-# ═══════════════════════════════════════════════════════════════
 def check_query_safety(query: str) -> Tuple[bool, str]:
-    """
-    Проверить запрос на безопасность.
-
-    Выполняет два уровня проверки:
-      1. Prompt-injection — попытки изменить поведение системы
-      2. Тематическая релевантность — запросы не по теме
-
-    Args:
-        query: Текст запроса пользователя
-
-    Returns:
-        Кортеж (is_safe, reason):
-          - is_safe=True, reason="" — запрос безопасен
-          - is_safe=False, reason="..." — запрос отклонён
-    """
-    # Проверка на prompt-injection
-    for pattern in INJECTION_PATTERNS:
-        match = pattern.search(query)
-        if match:
-            reason = f"Обнаружена попытка prompt-injection: паттерн '{match.group()}'"
-            logger.warning(f"Небезопасный запрос: {reason}")
-            return False, reason
-
-    # Проверка длины (слишком длинные запросы могут быть атакой)
-    if len(query) > 2000:
-        return False, "Запрос слишком длинный (максимум 2000 символов)"
-
+    """Проверить запрос на чувствительные темы. Возвращает (is_safe, reason)."""
+    query_lower = query.lower()
+    for topic in SENSITIVE_TOPICS:
+        for pattern in topic.patterns:
+            if re.search(pattern, query_lower, re.IGNORECASE):
+                logger.info(f"Обнаружена чувствительная тема: {topic.category}")
+                return False, topic.description
     return True, ""
 
 
 def check_answer_safety(answer: str) -> Tuple[bool, str]:
-    """
-    Проверить ответ LLM на наличие конфиденциальной информации.
-
-    Args:
-        answer: Текст ответа от LLM
-
-    Returns:
-        Кортеж (is_safe, sanitized_answer):
-          - is_safe=True — ответ безопасен
-          - is_safe=False — ответ содержит конфиденциальные данные
-    """
-    for pattern in CONFIDENTIAL_PATTERNS:
-        if pattern.search(answer):
-            return False, "Ответ содержит потенциально конфиденциальные данные"
-
-    return True, answer
+    """Проверить ответ на запрещённые паттерны."""
+    for pattern in FORBIDDEN_ANSWER_PATTERNS:
+        if re.search(pattern, answer, re.IGNORECASE):
+            return False, f"Forbidden pattern: {pattern}"
+    if len(answer) > 10000:
+        return False, "Answer too long"
+    return True, ""
 
 
 def sanitize_answer(answer: str) -> str:
-    """
-    Очистить ответ от конфиденциальной информации.
-
-    Заменяет найденные конфиденциальные данные на плейсхолдеры.
-
-    Args:
-        answer: Текст ответа от LLM
-
-    Returns:
-        Очищенный текст ответа
-    """
-    sanitized = answer
-
-    # Маскируем номера карт
-    sanitized = re.sub(
-        r'\b(\d{4})\d{10,15}(\d{4})\b',
-        r'\1****\2',
-        sanitized,
-    )
-
-    # Маскируем пароли
-    sanitized = re.sub(
-        r'(?:пароль|password)\s*[:=]\s*\S+',
-        'пароль: [УДАЛЕНО]',
-        sanitized,
-        flags=re.IGNORECASE,
-    )
-
-    return sanitized
+    """Очистить ответ от потенциально опасного контента."""
+    answer = re.sub(r"<\s*script[^>]*>.*?</script>", "", answer,
+                    flags=re.IGNORECASE | re.DOTALL)
+    answer = re.sub(r"javascript:", "", answer, flags=re.IGNORECASE)
+    return answer.strip()

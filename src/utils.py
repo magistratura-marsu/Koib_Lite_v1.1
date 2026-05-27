@@ -1,22 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-Koib-V-4.5 — Общие утилиты
+Koib-V-4.6 — Общие утилиты
+★ ИСПРАВЛЕНО: estimate_tokens (коэф. 0.25 вместо 0.6)
+★ ИСПРАВЛЕНО: clean_text сохраняет мат. символы и LaTeX
 """
 import re
 import uuid
 import hashlib
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Tuple
 
 logger = logging.getLogger("koib.utils")
 
 
 def clean_text(text: str) -> str:
+    """Очистка текста с сохранением математических символов и LaTeX."""
     if not text:
         return ""
+    # Удаляем только непечатаемые управляющие символы
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
     text = re.sub(r'[ \t]+', ' ', text)
+    # ★ ИСПРАВЛЕНО: сохраняем математические символы, LaTeX, пунктуацию
+    text = re.sub(
+        r'[^\w\s\-\+\=\*\/\(\)\[\]\{\}\$\<\>\,\.\;\:\!\?\%\&\|\^\~`\"\'\\@\#№°'
+        r'±≥≤≈×÷→←↑↓∈∑∫∂∇∞≈≠√∏∝∧∨¬⊂⊃⊆⊇∅∩∪'
+        r'\u0400-\u04FF\u2116\n\r\t]',
+        '', text, flags=re.UNICODE
+    )
     lines = [line.strip() for line in text.split('\n')]
+    # Убираем пустые строки с краёв
     while lines and not lines[0]:
         lines.pop(0)
     while lines and not lines[-1]:
@@ -29,18 +41,23 @@ def text_hash(text: str) -> str:
 
 
 def estimate_tokens(text: str) -> int:
+    """
+    ★ ИСПРАВЛЕНО: правильная оценка токенов для русского.
+    1 токен ≈ 4 символа (коэффициент 0.25).
+    Ранее был 0.6 — завышал в 2.4 раза.
+    """
     if not text:
         return 0
-    return max(1, int(len(text) * 0.6))
+    return max(1, int(len(text) * 0.25))
 
 
 def truncate_to_tokens(text: str, max_tokens: int) -> str:
     if not text:
         return ""
-    max_chars = int(max_tokens / 0.6)
+    max_chars = max_tokens * 4
     if len(text) <= max_chars:
         return text
-    return text[:max_chars]
+    return text[:max_chars].rsplit(' ', 1)[0] + "..."
 
 
 def generate_unique_id(prefix: str = "") -> str:
@@ -49,7 +66,7 @@ def generate_unique_id(prefix: str = "") -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-# ★ ВОЗВРАЩЕНО: специализированные паттерны КОИБ + уверенность
+# Детекция моделей КОИБ
 # ═══════════════════════════════════════════════════════════════
 KNOWN_MODELS = {"koib2010", "koib2017a", "koib2017b"}
 
@@ -70,12 +87,9 @@ KOIB_MODEL_PATTERNS: Dict[str, List[str]] = {
     ],
 }
 
-# Общие паттерны для устройств (fallback)
 _MODEL_PATTERNS = [
     re.compile(r'\b([A-ZА-Я]{2,}[\-\s]?\d{1,4}[A-ZА-Яа-я0-9\-/]*)\b'),
     re.compile(r'\b(модель\s+[A-ZА-Яа-я0-9\-/]+)\b', re.IGNORECASE),
-    re.compile(r'\b(тип\s+[A-ZА-Яа-я0-9\-/]+)\b', re.IGNORECASE),
-    re.compile(r'\b(марка\s+[A-ZА-Яа-я0-9\-/]+)\b', re.IGNORECASE),
 ]
 
 _FILENAME_MODEL_PATTERNS = [
@@ -84,15 +98,10 @@ _FILENAME_MODEL_PATTERNS = [
 
 
 def detect_model_in_text(text: str) -> Tuple[str, float]:
-    """
-    ★ ВОЗВРАЩЕНО: возвращает (модель, уверенность).
-    Сначала проверяет специфичные паттерны КОИБ (высокая уверенность),
-    затем общие паттерны устройств (низкая уверенность).
-    """
+    """Возвращает (модель, уверенность)."""
     if not text or len(text.strip()) < 5:
         return ("unknown", 0.0)
 
-    # 1. Специфичные КОИБ-паттерны
     scores: Dict[str, float] = {}
     for model_key, patterns in KOIB_MODEL_PATTERNS.items():
         match_count = 0
@@ -107,23 +116,19 @@ def detect_model_in_text(text: str) -> Tuple[str, float]:
         confidence = min(scores[best] / 3.0, 1.0)
         return (best, round(confidence, 3))
 
-    # 2. Общие паттерны устройств (низкая уверенность)
     for pattern in _MODEL_PATTERNS:
         match = pattern.search(text)
         if match:
             return (match.group(1).strip(), 0.3)
-
     return ("unknown", 0.0)
 
 
 def detect_model_from_filename(filename: str) -> str:
-    # Специфичные КОИБ-паттерны
     fn = filename.lower()
     for model_key, patterns in KOIB_MODEL_PATTERNS.items():
         for pat in patterns:
             if re.search(pat, fn, re.IGNORECASE):
                 return model_key
-    # Общие паттерны
     for pattern in _FILENAME_MODEL_PATTERNS:
         match = pattern.search(filename)
         if match:
@@ -132,7 +137,7 @@ def detect_model_from_filename(filename: str) -> str:
 
 
 _FIGURE_CAPTION_PATTERNS = [
-    re.compile(r'(?:Рис\.|Рисунок|рис\.|рисунок)\s*\d+[\.\:]?\s*(.+?)(?:\n|$)', re.IGNORECASE),
+    re.compile(r'(?:Рис\.|Рисунок)\s*\d+[\.\:]?\s*(.+?)(?:\n|$)', re.IGNORECASE),
     re.compile(r'(?:Схема|схема)\s*\d+[\.\:]?\s*(.+?)(?:\n|$)', re.IGNORECASE),
     re.compile(r'(?:Чертёж|чертёж)\s*\d+[\.\:]?\s*(.+?)(?:\n|$)', re.IGNORECASE),
 ]
