@@ -2,6 +2,11 @@
 import time, logging
 from pathlib import Path
 from typing import List, Optional, Set
+
+# ★ ПОДАВЛЕНИЕ СПАМА ОТ pymorphy2
+logging.getLogger("pymorphy2").setLevel(logging.WARNING)
+logging.getLogger("pymorphy2.opencorpora_dict").setLevel(logging.WARNING)
+
 from config import DOCS_DIR, OUTPUT_DIR, ensure_dirs
 from src.parsing import parse_pdf, parse_docx
 from src.chunking import SmartChunker
@@ -45,8 +50,12 @@ class BatchIngester:
         try:
             elements = parse_pdf(file_path) if ext == ".pdf" else parse_docx(file_path) if ext in (".docx", ".doc") else None
             if not elements: return False
+            
             chunks = self.chunker.chunk_elements(elements)
             if not chunks: return False
+            
+            # ★ ВИДИМЫЙ ПРОГРЕСС ИНДЕКСАЦИИ
+            print(f"[{len(chunks)} чанков] ", end="", flush=True)
             self.index_builder.add_chunks(chunks)
             return True
         except Exception as e:
@@ -58,7 +67,6 @@ class BatchIngester:
         t0 = time.time()
         files = self._discover_files()
         if not files: return
-        
         print(f"  Обнаружено файлов для индексации: {len(files)}")
         success_count = error_count = 0
         for i, fp in enumerate(files, 1):
@@ -67,11 +75,7 @@ class BatchIngester:
                 success_count += 1; self._processed_files.add(fp.name); print("OK")
             else:
                 error_count += 1; print("ОШИБКА")
-                
         self._save_processed_files()
-        
-        # ★ КРИТИЧЕСКИЙ ФИКС: Фиксация FAISS-индексов, DocStore и FTS5 на диске
         self.index_builder.save()
-        
-        print(f"\n  Результат: {success_count} успешно, {error_count} ошибок")
+        print(f"\nРезультат: {success_count} успешно, {error_count} ошибок")
         print(f"  Индексы успешно развернуты на диске. Время сборки: {time.time() - t0:.1f}с")
