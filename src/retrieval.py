@@ -1,17 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Koib-V-4.5 — Модуль гибридного поиска
-========================================
-Объединяет векторный поиск (FAISS), лексический (BM25) и
-переранжирование (CrossEncoder) для получения наиболее
-релевантных фрагментов документации.
-
-Ключевые отличия от v4.3:
-  - SQLite-кэш ответов HyDE (вместо JSON-файла)
-  - Уменьшенные K=8 и TOP_K=3 для скорости
-  - Лёгкий реранкер MiniLM-L-6-v2
-  - Определение интента запроса (таблица/формула/рисунок)
-  - Фильтрация карантинных чанков
+★ ДОБАВЛЕНО: Query Expansion для таблиц (вместо HyDE)
 """
 import json
 import logging
@@ -31,18 +21,7 @@ from config import (
 logger = logging.getLogger("koib.retrieval")
 
 
-# ═══════════════════════════════════════════════════════════════
-# SQLite Кэш ответов HyDE (мгновенная выдача повторных запросов)
-# ═══════════════════════════════════════════════════════════════
 class ResponseCache:
-    """
-    SQLite-кэш для гипотетических ответов HyDE.
-
-    При повторном запросе с тем же текстом система мгновенно
-    извлекает ранее сгенерированный гипотетический ответ,
-    экономя 5-10 секунд на вызове LLM.
-    """
-
     def __init__(self, path: Optional[Path] = None):
         self.path = path or METADATA_DIR / "response_cache.db"
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -57,21 +36,16 @@ class ResponseCache:
             ''')
 
     def _hash(self, text: str) -> str:
-        """MD5-хэш нормализованного текста запроса."""
         return hashlib.md5(text.lower().strip().encode()).hexdigest()
 
     def get(self, query: str) -> Optional[str]:
-        """Получить кэшированный гипотетический ответ."""
         cur = self.conn.cursor()
-        cur.execute(
-            'SELECT hypothetical FROM cache WHERE query_hash = ?',
-            (self._hash(query),),
-        )
+        cur.execute('SELECT hypothetical FROM cache WHERE query_hash = ?',
+                    (self._hash(query),))
         row = cur.fetchone()
         return row[0] if row else None
 
     def set(self, query: str, hypothetical: str) -> None:
-        """Сохранить гипотетический ответ в кэш."""
         with self.conn:
             self.conn.execute(
                 'INSERT OR REPLACE INTO cache (query_hash, hypothetical) VALUES (?, ?)',
@@ -79,31 +53,12 @@ class ResponseCache:
             )
 
     def clear(self) -> None:
-        """Очистить весь кэш."""
         with self.conn:
             self.conn.execute('DELETE FROM cache')
 
 
-# ═══════════════════════════════════════════════════════════════
-# Структура результата поиска
-# ═══════════════════════════════════════════════════════════════
 @dataclass
 class RetrievalResult:
-    """
-    Результат поиска одного фрагмента.
-
-    Attributes:
-        chunk_id:     Идентификатор чанка
-        content:      Сводный текст (или основной текст для text-чанков)
-        full_content: Полный контент (из DocStore, для таблиц/формул)
-        score:        Оценка релевантности
-        source:       Имя файла-источника
-        page:         Номер страницы
-        heading:      Заголовок раздела
-        model:        Модель устройства
-        chunk_type:   Тип чанка
-        metadata:     Полные метаданные
-    """
     chunk_id: str
     content: str
     full_content: Optional[str] = None
@@ -120,18 +75,10 @@ class RetrievalResult:
             self.metadata = {}
 
     def to_context_string(self) -> str:
-        """
-        Форматировать результат для подачи в LLM-промпт.
-
-        Включает метаданные источника, заголовок раздела
-        и полный контент (или основной, если полного нет).
-        """
         parts = [f"[Документ: {self.source}, стр. {self.page}]"]
         if self.heading:
             parts.append(f"Раздел: {self.heading}")
-
         display_content = self.full_content or self.content
-
         if self.chunk_type == "table":
             parts.append(f"ТАБЛИЦА:\n{display_content}")
         elif self.chunk_type == "formula":
@@ -140,63 +87,51 @@ class RetrievalResult:
             parts.append(f"РИСУНОК: {display_content}")
         else:
             parts.append(display_content)
-
         return "\n".join(parts)
 
 
-# ═══════════════════════════════════════════════════════════════
-# Определение интента запроса
-# ═══════════════════════════════════════════════════════════════
 TABLE_KEYWORDS = {"таблиц", "значени", "параметр", "сводк", "данные", "показател"}
 FORMULA_KEYWORDS = {"формул", "вычислен", "расчёт", "уравнен", "коэффициент"}
 FIGURE_KEYWORDS = {"схем", "рисунок", "диаграмм", "чертёж", "график"}
 
+# ★ НОВОЕ: расширения запросов для таблиц (без LLM, чистая эвристика)
+TABLE_EXPANSION_SUFFIXES = [
+    " таблица параметры значения",
+    " характеристики спецификация",
+]
+
 
 def _detect_query_intent(query: str) -> Dict[str, float]:
-    """
-    Определить интент запроса по ключевым словам.
-
-    Возвращает словарь весов для каждого типа контента:
-      - table, formula, figure, text
-
-    Если запрос содержит ключевые слова таблиц, вес table
-    повышается, а вес text снижается, но остаётся не ниже 0.3.
-    """
     query_lower = query.lower()
     intent = {"table": 0.0, "formula": 0.0, "figure": 0.0, "text": 1.0}
-
     table_hits = sum(1 for kw in TABLE_KEYWORDS if kw in query_lower)
     formula_hits = sum(1 for kw in FORMULA_KEYWORDS if kw in query_lower)
     figure_hits = sum(1 for kw in FIGURE_KEYWORDS if kw in query_lower)
-
     total_hits = table_hits + formula_hits + figure_hits
     if total_hits > 0:
         intent["table"] = min(table_hits / 2.0, 1.0)
         intent["formula"] = min(formula_hits / 2.0, 1.0)
         intent["figure"] = min(figure_hits / 2.0, 1.0)
         intent["text"] = max(0.3, 1.0 - total_hits * 0.2)
-
     return intent
 
 
-# ═══════════════════════════════════════════════════════════════
-# Гибридный поисковик
-# ═══════════════════════════════════════════════════════════════
+def _expand_query_for_tables(query: str, intent: Dict[str, float]) -> List[str]:
+    """
+    ★ НОВОЕ: Query Expansion для табличных запросов.
+    Вместо HyDE (который шумит на слабой LLM) генерируем несколько
+    эвристических вариантов запроса с табличными ключевыми словами.
+    Это повышает recall без затрат CPU/RAM.
+    """
+    queries = [query]
+    if intent.get("table", 0) >= 0.5:
+        for suffix in TABLE_EXPANSION_SUFFIXES:
+            expanded = query + suffix
+            queries.append(expanded)
+    return queries
+
+
 class HybridRetriever:
-    """
-    Гибридный поисковик: FAISS (векторный) + BM25 (лексический)
-    с переранжированием и HyDE.
-
-    Pipeline:
-      1. Определение интента запроса
-      2. (Опционально) HyDE — генерация гипотетического ответа
-      3. Векторный поиск по двум индексам (текст + сводки)
-      4. BM25-поиск
-      5. Reciprocal Rank Fusion (объединение результатов)
-      6. (Опционально) Переранжирование CrossEncoder
-      7. Подгрузка полного контента из DocStore
-    """
-
     def __init__(self, index_builder: Optional[IndexBuilder] = None):
         self.index_builder = index_builder or IndexBuilder()
         self.index_builder.load()
@@ -204,12 +139,6 @@ class HybridRetriever:
         self._cache = ResponseCache()
 
     def _get_reranker(self):
-        """
-        Ленивая загрузка переранжировщика.
-
-        CrossEncoder загружается только при первом использовании,
-        чтобы не расходовать RAM, если переранжирование отключено.
-        """
         if self._reranker is not None:
             return self._reranker
         if not USE_RERANKER:
@@ -230,60 +159,37 @@ class HybridRetriever:
         model_filter: str = "",
         use_hyde: Optional[bool] = None,
     ) -> List[RetrievalResult]:
-        """
-        Выполнить гибридный поиск по запросу.
-
-        Args:
-            query:        Поисковый запрос пользователя
-            k:            Количество финальных результатов
-            model_filter: Фильтр по модели устройства
-            use_hyde:     Использовать ли HyDE (None = по конфигу)
-
-        Returns:
-            Список RetrievalResult, отсортированный по релевантности
-        """
-        # Шаг 1: Интент запроса
         intent = _detect_query_intent(query)
 
-        # Шаг 2: HyDE (опционально)
         search_query = query
-        if use_hyde if use_hyde is not None else USE_HYDE:
+        use_hyde_flag = use_hyde if use_hyde is not None else USE_HYDE
+        if use_hyde_flag:
             hyde_result = self._apply_hyde(query)
             if hyde_result:
                 search_query = hyde_result
 
-        # Шаг 3: Векторный поиск
+        # ★ ИЗМЕНЕНО: векторный поиск с query expansion для таблиц
         vector_results = self._vector_search(search_query, intent, model_filter)
-
-        # Шаг 4: BM25-поиск
         bm25_results = self._bm25_search(query, model_filter)
-
-        # Шаг 5: Reciprocal Rank Fusion
         fused = self._reciprocal_rank_fusion(vector_results, bm25_results)
 
-        # Фильтрация карантинных чанков
         try:
             from .quarantine import filter_quarantined_chunks
             fused = filter_quarantined_chunks(fused)
         except Exception:
             pass
 
-        # Шаг 6: Переранжирование (опционально)
         if USE_RERANKER and len(fused) > k:
             reranker = self._get_reranker()
             if reranker:
                 fused = self._rerank(query, fused, reranker)
 
-        # Шаг 7: Ограничение количества результатов
         results = fused[:k]
-
-        # Подгрузка полного контента из DocStore
         for r in results:
             if r.chunk_type in ("table", "formula", "figure") and r.full_content is None:
                 full = self.index_builder.docstore.get_content(r.chunk_id)
                 if full:
                     r.full_content = full
-
         return results
 
     def _vector_search(
@@ -292,65 +198,71 @@ class HybridRetriever:
         intent: Dict[str, float],
         model_filter: str = "",
     ) -> List[RetrievalResult]:
-        """
-        Векторный поиск по двум FAISS-индексам.
-
-        Выполняет поиск по текстовому индексу и индексу сводок,
-        затем объединяет результаты с учётом интента запроса.
-        """
         results: List[RetrievalResult] = []
-        search_text = f"{QUERY_PREFIX}{query}" if QUERY_PREFIX else query
+        seen_ids: set = set()
 
-        # Поиск по текстовому индексу
-        if self.index_builder.text_vectorstore is not None:
-            try:
-                docs = self.index_builder.text_vectorstore.similarity_search_with_score(
-                    search_text,
-                    k=VECTOR_SEARCH_K,
-                )
-                for doc, score in docs:
-                    chunk_type = doc.metadata.get("chunk_type", "text")
-                    r = RetrievalResult(
-                        chunk_id=doc.metadata.get("chunk_id", ""),
-                        content=doc.page_content,
-                        score=float(score) * intent.get("text", 1.0),
-                        source=doc.metadata.get("source", ""),
-                        page=doc.metadata.get("page", 0),
-                        heading=doc.metadata.get("heading", ""),
-                        model=doc.metadata.get("model", "unknown"),
-                        chunk_type=chunk_type,
-                        metadata=doc.metadata,
-                    )
-                    if not model_filter or r.model == model_filter:
-                        results.append(r)
-            except Exception as exc:
-                logger.warning(f"Ошибка векторного поиска по текстам: {exc}")
+        # ★ Query Expansion: несколько вариантов запроса для таблиц
+        queries = _expand_query_for_tables(query, intent)
 
-        # Поиск по индексу сводок
-        if self.index_builder.summary_vectorstore is not None:
-            try:
-                docs = self.index_builder.summary_vectorstore.similarity_search_with_score(
-                    search_text,
-                    k=VECTOR_SEARCH_K,
-                )
-                for doc, score in docs:
-                    chunk_type = doc.metadata.get("chunk_type", "text")
-                    type_weight = intent.get(chunk_type, 1.0)
-                    r = RetrievalResult(
-                        chunk_id=doc.metadata.get("chunk_id", ""),
-                        content=doc.page_content,
-                        score=float(score) * type_weight,
-                        source=doc.metadata.get("source", ""),
-                        page=doc.metadata.get("page", 0),
-                        heading=doc.metadata.get("heading", ""),
-                        model=doc.metadata.get("model", "unknown"),
-                        chunk_type=chunk_type,
-                        metadata=doc.metadata,
+        for q_idx, search_query in enumerate(queries):
+            search_text = f"{QUERY_PREFIX}{search_query}" if QUERY_PREFIX else search_query
+            # Вес снижается для расширенных вариантов
+            expansion_weight = 1.0 if q_idx == 0 else 0.85
+
+            if self.index_builder.text_vectorstore is not None:
+                try:
+                    docs = self.index_builder.text_vectorstore.similarity_search_with_score(
+                        search_text, k=VECTOR_SEARCH_K,
                     )
-                    if not model_filter or r.model == model_filter:
-                        results.append(r)
-            except Exception as exc:
-                logger.warning(f"Ошибка векторного поиска по сводкам: {exc}")
+                    for doc, score in docs:
+                        chunk_id = doc.metadata.get("chunk_id", "")
+                        if chunk_id in seen_ids:
+                            continue
+                        seen_ids.add(chunk_id)
+                        chunk_type = doc.metadata.get("chunk_type", "text")
+                        r = RetrievalResult(
+                            chunk_id=chunk_id,
+                            content=doc.page_content,
+                            score=float(score) * intent.get("text", 1.0) * expansion_weight,
+                            source=doc.metadata.get("source", ""),
+                            page=doc.metadata.get("page", 0),
+                            heading=doc.metadata.get("heading", ""),
+                            model=doc.metadata.get("model", "unknown"),
+                            chunk_type=chunk_type,
+                            metadata=doc.metadata,
+                        )
+                        if not model_filter or r.model == model_filter:
+                            results.append(r)
+                except Exception as exc:
+                    logger.warning(f"Ошибка векторного поиска по текстам: {exc}")
+
+            if self.index_builder.summary_vectorstore is not None:
+                try:
+                    docs = self.index_builder.summary_vectorstore.similarity_search_with_score(
+                        search_text, k=VECTOR_SEARCH_K,
+                    )
+                    for doc, score in docs:
+                        chunk_id = doc.metadata.get("chunk_id", "")
+                        if chunk_id in seen_ids:
+                            continue
+                        seen_ids.add(chunk_id)
+                        chunk_type = doc.metadata.get("chunk_type", "text")
+                        type_weight = intent.get(chunk_type, 1.0)
+                        r = RetrievalResult(
+                            chunk_id=chunk_id,
+                            content=doc.page_content,
+                            score=float(score) * type_weight * expansion_weight,
+                            source=doc.metadata.get("source", ""),
+                            page=doc.metadata.get("page", 0),
+                            heading=doc.metadata.get("heading", ""),
+                            model=doc.metadata.get("model", "unknown"),
+                            chunk_type=chunk_type,
+                            metadata=doc.metadata,
+                        )
+                        if not model_filter or r.model == model_filter:
+                            results.append(r)
+                except Exception as exc:
+                    logger.warning(f"Ошибка векторного поиска по сводкам: {exc}")
 
         return results
 
@@ -359,14 +271,7 @@ class HybridRetriever:
         query: str,
         model_filter: str = "",
     ) -> List[RetrievalResult]:
-        """
-        BM25-лексический поиск.
-
-        Использует токенизацию с фильтрацией стоп-слов
-        для повышения точности поиска на русском языке.
-        """
         results: List[RetrievalResult] = []
-
         bm25_hits = self.index_builder.bm25.search(query, k=BM25_SEARCH_K)
         for metadata, score in bm25_hits:
             r = RetrievalResult(
@@ -382,7 +287,6 @@ class HybridRetriever:
             )
             if not model_filter or r.model == model_filter:
                 results.append(r)
-
         return results
 
     def _reciprocal_rank_fusion(
@@ -391,45 +295,24 @@ class HybridRetriever:
         bm25_results: List[RetrievalResult],
         k_rrf: int = 60,
     ) -> List[RetrievalResult]:
-        """
-        Reciprocal Rank Fusion (RRF) для объединения результатов.
-
-        Формула: RRF_score = sum(1 / (k_rrf + rank_i))
-
-        Args:
-            vector_results: Результаты векторного поиска
-            bm25_results:   Результаты BM25-поиска
-            k_rrf:          Параметр сглаживания RRF (по умолчанию 60)
-
-        Returns:
-            Объединённый список RetrievalResult
-        """
         chunk_scores: Dict[str, float] = {}
         chunk_map: Dict[str, RetrievalResult] = {}
-
-        # Векторные результаты
         for rank, r in enumerate(vector_results, 1):
             if r.chunk_id not in chunk_scores:
                 chunk_scores[r.chunk_id] = 0.0
                 chunk_map[r.chunk_id] = r
             chunk_scores[r.chunk_id] += HYBRID_ALPHA / (k_rrf + rank)
-
-        # BM25-результаты
         for rank, r in enumerate(bm25_results, 1):
             if r.chunk_id not in chunk_scores:
                 chunk_scores[r.chunk_id] = 0.0
                 chunk_map[r.chunk_id] = r
             chunk_scores[r.chunk_id] += (1 - HYBRID_ALPHA) / (k_rrf + rank)
-
-        # Сортировка по итоговому RRF-скору
         sorted_ids = sorted(chunk_scores.keys(), key=lambda x: chunk_scores[x], reverse=True)
-
         results = []
         for cid in sorted_ids:
             r = chunk_map[cid]
             r.score = chunk_scores[cid]
             results.append(r)
-
         return results
 
     def _rerank(
@@ -438,19 +321,11 @@ class HybridRetriever:
         results: List[RetrievalResult],
         reranker,
     ) -> List[RetrievalResult]:
-        """
-        Переранжирование результатов через CrossEncoder.
-
-        Модель оценивает пару (запрос, документ) и возвращает
-        оценку релевантности, которая используется для пересортировки.
-        """
         try:
             pairs = [(query, r.content) for r in results]
             scores = reranker.predict(pairs)
-
             for r, score in zip(results, scores):
                 r.score = float(score)
-
             results.sort(key=lambda x: x.score, reverse=True)
             return results
         except Exception as exc:
@@ -458,23 +333,9 @@ class HybridRetriever:
             return results
 
     def _apply_hyde(self, query: str) -> Optional[str]:
-        """
-        HyDE (Hypothetical Document Embeddings).
-
-        Генерирует гипотетический ответ на запрос через LLM,
-        затем использует его для векторного поиска вместо
-        оригинального запроса. Это улучшает качество поиска,
-        так как ответы и документы лежат в одном семантическом
-        пространстве.
-
-        Результат кэшируется в SQLite для мгновенного
-        извлечения при повторных запросах.
-        """
-        # Проверяем кэш
         cached = self._cache.get(query)
         if cached:
             return cached
-
         try:
             from src.generation import LLMClient
             client = LLMClient()
@@ -488,5 +349,4 @@ class HybridRetriever:
                 return hypothetical
         except Exception as exc:
             logger.debug(f"HyDE ошибка: {exc}")
-
         return None
