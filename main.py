@@ -41,17 +41,19 @@ def cmd_ingest(args) -> None:
 
 
 def cmd_query(args) -> None:
-    from src.generation import AnswerGenerator
+    from src.rag_pipeline import RAGPipeline
     print("=" * 50)
-    print("  KOIB-V-4.6 — ЗАПРОС")
+    print("  KOIB-V-4.8 — ЗАПРОС")
     print("=" * 50)
-    generator = AnswerGenerator()
+    pipeline = RAGPipeline()
     t0 = time.time()
-    result = generator.answer(
+    result = asyncio.run(pipeline.answer(
         query=args.query,
+        user_id="cli_user",
         k=args.top_k,
-        model_filter=args.model,
-    )
+        use_memory=False,  # CLI без памяти
+        validate=True,     # В CLI валидация включена
+    ))
     print(f"\nЗапрос: {args.query}")
     print(f"\nОТВЕТ:\n{result['answer']}")
     if result.get("sources"):
@@ -61,7 +63,11 @@ def cmd_query(args) -> None:
             if src.get("heading"):
                 print(f" — {src['heading']}", end="")
             print()
-    print(f"\nВремя: {time.time() - t0:.2f}с")
+    trace = result.get("trace", {})
+    print(f"\nВремя: {trace.get('latency_ms', 0) / 1000:.2f}с")
+    print(f"Prompt tokens: {trace.get('prompt_tokens', 0)}")
+    if trace.get("rewritten_query"):
+        print(f"Rewritten: {trace['rewritten_query']}")
 
 
 def cmd_serve(args) -> None:
