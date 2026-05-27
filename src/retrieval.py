@@ -4,6 +4,7 @@ Koib-V-4.6 — Модуль гибридного поиска
 ★ ИСПРАВЛЕНО: BM25 теперь работает через SQLite FTS5 (не ест RAM)
 ★ Семантическое кэширование через SQLite
 ★ ONNX-квантизация реранкера
+★ ДОБАВЛЕНО: методы clear() в ResponseCache и SemanticCache
 """
 import json
 import logging
@@ -12,7 +13,6 @@ import hashlib
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from pathlib import Path
-
 import numpy as np
 
 from .indexing import IndexBuilder, get_global_embeddings
@@ -108,6 +108,37 @@ class SemanticCache:
         except Exception as exc:
             logger.debug(f"Semantic cache set error: {exc}")
 
+    # ★ НОВОЕ: очистка кэша (для тестов и будущей ротации)
+    def clear(self) -> None:
+        """Полностью очистить семантический кэш."""
+        try:
+            with self.conn:
+                self.conn.execute('DELETE FROM cache')
+            logger.info("Semantic cache очищен")
+        except Exception as exc:
+            logger.debug(f"Semantic cache clear error: {exc}")
+
+    def purge_stale(self, days: int = 30, min_hits: int = 1) -> int:
+        """
+        Удалить старые записи с низким hit_count (ротация кэша).
+        Возвращает количество удалённых записей.
+        """
+        try:
+            with self.conn:
+                cur = self.conn.execute(
+                    '''DELETE FROM cache
+                       WHERE hit_count <= ?
+                         AND julianday('now') - julianday(created_at) > ?''',
+                    (min_hits, days),
+                )
+                deleted = cur.rowcount
+            if deleted:
+                logger.info(f"Semantic cache: удалено {deleted} устаревших записей")
+            return deleted
+        except Exception as exc:
+            logger.debug(f"Semantic cache purge error: {exc}")
+            return 0
+
 
 class ResponseCache:
     """HyDE-кэш."""
@@ -141,6 +172,15 @@ class ResponseCache:
                 'INSERT OR REPLACE INTO cache (query_hash, hypothetical) VALUES (?, ?)',
                 (self._hash(query), hypothetical),
             )
+
+    # ★ НОВОЕ: очистка кэша (нужно для теста test_cache_clear)
+    def clear(self) -> None:
+        """Полностью очистить HyDE-кэш."""
+        try:
+            with self.conn:
+                self.conn.execute('DELETE FROM cache')
+        except Exception as exc:
+            logger.debug(f"ResponseCache clear error: {exc}")
 
 
 @dataclass
@@ -260,7 +300,6 @@ class HybridRetriever:
 
         vector_results = self._vector_search(search_query, intent, model_filter)
         bm25_results = self._bm25_search(query, model_filter)
-
         fused = self._reciprocal_rank_fusion(vector_results, bm25_results)
 
         try:
