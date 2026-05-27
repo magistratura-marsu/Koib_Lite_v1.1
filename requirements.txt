@@ -1,43 +1,23 @@
-# Koib-V-4.7 — Production-ready RAG (2GB RAM optimized)
-# ★ ДОБАВЛЕНО: pymorphy2 для лемматизации в BM25 (критично для Recall)
-
-# PDF Parsing
+# Koib-V-4.8 — Production-ready RAG (2GB RAM optimized)
 PyMuPDF>=1.23.8
 Pillow>=10.0.0
 pytesseract>=0.3.10
-
-# DOCX Parsing
 python-docx>=1.1.0
-
-# LangChain & Vector Store
 langchain-community>=0.0.30
 langchain-core>=0.1.0
 langchain-huggingface>=0.0.1
 faiss-cpu>=1.7.4
-
-# Async Web & Bot
 fastapi>=0.103.0
 uvicorn[standard]>=0.23.2
 aiohttp>=3.9.0
-
-# HTTP
 requests>=2.31.0
 urllib3>=2.0.0
-
-# Data Processing
 numpy>=1.24.0
 pandas>=2.0.0
 tabulate>=0.9.0
-
-# ★ НОВОЕ: Лемматизация русского языка для FTS5
 pymorphy2>=0.9.1
-
-# ONNX runtime for reranker quantization
 onnxruntime>=1.16.0
-
-# Testing
 pytest>=7.4.0
 pytest-asyncio>=0.21.0
-
 cachetools>=5.3.0
 pydantic>=2.0.0
