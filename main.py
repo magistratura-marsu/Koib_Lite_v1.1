@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
-import sys, time, json, argparse, logging, asyncio
+import sys, time, json, argparse, logging, asyncio, os
 from pathlib import Path
+
+# ★ ОТКЛЮЧАЕМ ПРОВЕРКУ ОБНОВЛЕНИЙ МОДЕЛЕЙ (Мгновенный старт без HEAD-запросов)
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 from config import DOCS_DIR, OUTPUT_DIR, FINAL_TOP_K, ensure_dirs
@@ -13,24 +18,37 @@ def cmd_ingest(args):
 
 def cmd_query(args):
     from src.rag_pipeline import RAGPipeline
-    pipeline = RAGPipeline()
-    t0 = time.time()
-    result = asyncio.run(pipeline.answer(query=args.query, user_id="cli", k=args.top_k, use_memory=False, validate=True))
-    print(f"\nОТВЕТ:\n{result['answer']}")
-    if result.get("sources"):
-        print("\nИсточники:")
-        for s in result["sources"]: print(f"  - {s['document']}, стр. {s['page']}")
-    print(f"\nВремя: {time.time() - t0:.2f}с")
+    
+    async def run():
+        pipeline = RAGPipeline()
+        t0 = time.time()
+        result = await pipeline.answer(query=args.query, user_id="cli", k=args.top_k, use_memory=False, validate=True)
+        
+        print(f"\nОТВЕТ:\n{result['answer']}")
+        
+        if result.get("sources"):
+            print("\nИсточники:")
+            seen = set()
+            # ★ Дедупликация: убираем повторы страниц
+            for s in result["sources"]:
+                key = f"{s['document']}_{s['page']}"
+                if key not in seen:
+                    seen.add(key)
+                    print(f"  - {s['document']}, стр. {s['page']}")
+                    
+        print(f"\nВремя: {time.time() - t0:.2f}с")
+        
+        # ★ Корректное закрытие сетевых соединений (убирает красные ошибки)
+        if hasattr(pipeline.llm, '_session') and pipeline.llm._session and not pipeline.llm._session.closed:
+            await pipeline.llm._session.close()
+
+    asyncio.run(run())
 
 def cmd_serve(args):
     import uvicorn
     uvicorn.run("api.app:app", host=args.host, port=args.port, log_level="info")
 
 def cmd_evaluate(args):
-    from src.evaluation import RAGEvaluator, print_report
-    from src.generation import LLMClient, build_prompt
-    from src.retrieval import HybridRetriever
-    # Упрощенный evaluate для CLI (использует RAGPipeline логику)
     print("Оценка качества запущена...")
 
 def main():
@@ -45,6 +63,7 @@ def main():
     parser.add_argument("--incremental", action="store_true")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    
     args = parser.parse_args()
     ensure_dirs()
     
