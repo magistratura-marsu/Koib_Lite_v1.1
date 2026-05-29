@@ -30,7 +30,7 @@ FINAL_TOP_K = int(os.getenv("FINAL_TOP_K", "4"))
 HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.6"))
 
 USE_RERANKER = os.getenv("USE_RERANKER", "true").lower() == "true"
-RERANKER_MODEL = os.getenv("RERANKER_MODEL", "DiTy/ru-reranker-base")
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 USE_ONNX_RERANKER = os.getenv("USE_ONNX_RERANKER", "true").lower() == "true"
 USE_HYDE = os.getenv("USE_HYDE", "false").lower() == "true"
 BM25_USE_STOPWORDS = os.getenv("BM25_USE_STOPWORDS", "true").lower() == "true"
